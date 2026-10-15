@@ -44,8 +44,14 @@ def node_analyze(state):
         analysis = llm.invoke([
             {"role": "system", "content": (
                 "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                "If your confidence in the review is below 60%, you are NOT confident "
+                "enough to post — so populate `escalation_questions` with 2-4 specific, "
+                "context-rich questions a human reviewer must answer before the review "
+                "can be finalized. Each question must name the concrete file, function "
+                "or line in the diff it is about (e.g. 'Why is MD5 used in "
+                "auth.py:hash_password instead of bcrypt?') and ask about intent or "
+                "threat model — not generic process questions. "
+                "If your confidence is 60% or above, leave `escalation_questions` empty."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
@@ -71,22 +77,52 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    # interrupt() returns exactly what the caller passed via Command(resume=...),
+    # i.e. a {question: answer} dict collected by handle_interrupt().
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    a = state["analysis"]
+    answers = state.get("escalation_answers") or {}
+    qa = "\n\n".join(f"Q: {q}\nA: {ans}" for q, ans in answers.items())
+
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining the review with reviewer answers...[/dim]"):
+        refined = llm.invoke([
+            {"role": "system", "content": (
+                "Senior reviewer. A human reviewer has answered your questions about "
+                "this PR. Use those answers as ground truth about intent and constraints, "
+                "then produce a REFINED, final review. Drop or soften any comment the "
+                "answers have resolved, keep (and sharpen) the ones that still stand, and "
+                "re-assess your confidence now that the ambiguity is resolved."
+            )},
+            {"role": "user", "content": (
+                f"Title: {state['pr_title']}\n\n"
+                f"--- DIFF ---\n{state['pr_diff']}\n\n"
+                f"--- YOUR INITIAL ANALYSIS ---\n"
+                f"Summary: {a.summary}\n"
+                f"Confidence: {a.confidence:.0%}\n"
+                f"Reasoning: {a.confidence_reasoning}\n"
+                f"Risk factors: {', '.join(a.risk_factors) or 'none'}\n\n"
+                f"--- REVIEWER'S ANSWERS ---\n{qa}"
+            )},
+        ])
+    console.print(
+        f"  [green]✓[/green] refined confidence={refined.confidence:.0%} "
+        f"(was {a.confidence:.0%})"
+    )
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +197,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

@@ -22,12 +22,8 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_conn, db_path
+from exercises.exercise_4_audit import build_graph, handle_interrupt
 
 
 load_dotenv()
@@ -50,12 +46,58 @@ st.title("HITL PR Review Agent")
 
 
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
+async def _load_recent_threads() -> list[dict]:
+    """Query audit_events for the most recent review sessions."""
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT thread_id,
+                   pr_url,
+                   MAX(timestamp)  AS last_event,
+                   COUNT(*)         AS events,
+                   -- 'high' < 'med' < 'low' alphabetically, so MAX() would
+                   -- always return 'low'. Rank explicitly to get the worst risk.
+                   MAX(CASE risk_level WHEN 'high' THEN 3 WHEN 'med' THEN 2 ELSE 1 END)
+                                      AS risk_rank
+              FROM audit_events
+             GROUP BY thread_id, pr_url
+             ORDER BY MAX(timestamp) DESC
+             LIMIT 15
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["worst_risk"] = {3: "high", 2: "med"}.get(d.pop("risk_rank"), "low")
+        out.append(d)
+    return out
+
+
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    try:
+        _threads = asyncio.run(_load_recent_threads())
+    except Exception:
+        _threads = []
+
+    if not _threads:
+        st.caption("No sessions yet — run a review.")
+    else:
+        for t in _threads:
+            risk = t["worst_risk"]
+            icon = {"high": "🔴", "med": "🟡", "low": "🟢"}[risk]
+            short = t["pr_url"].rstrip("/").split("/")[-2:]
+            label = f"{icon} {'/'.join(short)} · {t['events']}ev"
+            if st.button(
+                label, key=f"thread-{t['thread_id']}", use_container_width=True,
+                disabled=(t["thread_id"] == st.session_state.thread_id),
+            ):
+                st.session_state.thread_id = t["thread_id"]
+                st.session_state.pr_url = t["pr_url"]
+                st.session_state.interrupt_payload = None
+                st.session_state.final = None
+                st.rerun()
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -87,12 +129,12 @@ def render_approval_card(payload: dict) -> dict | None:
     #   {"choice": "approve", "feedback": feedback}
     #   {"choice": "reject",  "feedback": feedback}
     #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
+    if col1.button("Approve", type="primary", use_container_width=True, key="btn_approve"):
+        return {"choice": "approve", "feedback": feedback}
+    if col2.button("Reject", use_container_width=True, key="btn_reject"):
+        return {"choice": "reject", "feedback": feedback}
+    if col3.button("Edit", use_container_width=True, key="btn_edit"):
+        return {"choice": "edit", "feedback": feedback or "Please refine the review."}
     return None
 
 
@@ -110,7 +152,15 @@ def render_escalation_card(payload: dict) -> dict | None:
         #       collect answers into a dict {question: answer_str}
         #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+    for i, q in enumerate(payload["questions"]):
+        answers[q] = st.text_input(f"Q{i + 1}: {q}", key=f"esc_q_{i}")
+    if st.form_submit_button("Submit answers"):
+        filled = {q: a for q, a in answers.items() if a.strip()}
+        if filled:
+            return filled
+        # Reviewer submitted nothing — make the ambiguity explicit rather than
+        # silently synthesising against empty context.
+        return {payload["questions"][0]: "No context given — treat every risk as a blocker."}
     return None
 
 
@@ -122,6 +172,7 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
         # TODO: build the graph with `cp` as the checkpointer (use the function
         # you imported/copied at the top of this file).
         # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
         # TODO:
@@ -130,7 +181,9 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
         # - Else:                    result = await app.ainvoke(
         #       Command(resume=resume_value), cfg)
         # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            return await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        return await app.ainvoke(Command(resume=resume_value), cfg)
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
